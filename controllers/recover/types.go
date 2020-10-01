@@ -16,17 +16,17 @@ package recover
 import (
 	"context"
 	"errors"
-	"reflect"
 
 	"github.com/go-logr/logr"
 	"github.com/hashicorp/go-multierror"
 
 	"github.com/chaos-mesh/chaos-mesh/api/v1alpha1"
+	"github.com/chaos-mesh/chaos-mesh/controllers/common"
+	"github.com/chaos-mesh/chaos-mesh/controllers/networkchaos/podnetworkmanager"
 	"github.com/chaos-mesh/chaos-mesh/controllers/reconciler"
 	"github.com/chaos-mesh/chaos-mesh/pkg/utils"
 
 	v1 "k8s.io/api/core/v1"
-	k8serror "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 
@@ -42,73 +42,103 @@ type Reconciler struct {
 	Log logr.Logger
 }
 
-// NewReconciler would create Reconciler for common chaos
-func NewReconciler(reconcile reconciler.InnerReconciler, c client.Client, r client.Reader, log logr.Logger) *Reconciler {
-	return &Reconciler{
-		InnerReconciler: reconcile,
-		Client:          c,
-		Reader:          r,
-		Log:             log,
+type Recoverer interface {
+	FinalizersFunc() []string
+	AnnotationsFunc() map[string]string
+	NameFunc() string
+	NamespaceFunc() string
+}
+
+type recover struct {
+	Finalizers  []string
+	Annotations map[string]string
+	Name        string
+	Namespace   string
+}
+
+func (rc *recover) FinalizersFunc() []string {
+	return rc.Finalizers
+}
+
+func (rc *recover) AnnotationsFunc() map[string]string {
+	return rc.Annotations
+}
+
+func (rc *recover) NameFunc() string {
+	return rc.Name
+}
+
+func (rc *recover) NamespaceFunc() string {
+	return rc.Namespace
+}
+
+func typeof(v interface{}, chaos v1alpha1.InnerObject) (*recover, string) {
+	switch v.(type) {
+	case *v1alpha1.NetworkChaos:
+		somechaos, _ := chaos.(*v1alpha1.StressChaos)
+		networkchaos := &recover{Finalizers: somechaos.Finalizers, Annotations: somechaos.Annotations}
+		return networkchaos, "NetworkChaos"
+	default:
+		return nil, "unknown"
 	}
 }
 
 // Recover means the reconciler recovers the chaos action
-func (r *Reconciler) Recover(ctx context.Context, req ctrl.Request, chaos v1alpha1.InnerObject) error {
+func (r *Reconciler) Recover(ctx context.Context, req ctrl.Request, chaos v1alpha1.InnerObject, v interface{}) error {
 	stresschaos, ok := chaos.(*v1alpha1.StressChaos)
+	somechaos, name := typeof(v, chaos)
 	if !ok {
 		err := errors.New("chaos is not StressChaos")
 		r.Log.Error(err, "chaos is not StressChaos", "chaos", chaos)
 		return err
 	}
 
-	if err := r.cleanFinalizersAndRecover(ctx, stresschaos); err != nil {
+	if err := r.cleanFinalizersAndRecover(ctx, somechaos); err != nil {
 		return err
 	}
-	r.Event(stresschaos, v1.EventTypeNormal, utils.EventChaosRecovered, "")
+	r.Event(somechaos, v1.EventTypeNormal, utils.EventChaosRecovered, "")
 
 	return nil
 }
 
-func (r *Reconciler) cleanFinalizersAndRecover(ctx context.Context, chaos interface{}) error {
+func (r *Reconciler) cleanFinalizersAndRecover(ctx context.Context, chaos *recover) error {
 	var result error
-	chaostype := reflect.TypeOf(chaos)
 
-	for _, key := range chaos.Finalizers {
+	source := chaos.Namespace + "/" + chaos.Name
+	m := podnetworkmanager.New(source, r.Log, r.Client, r.Reader)
+
+	for _, key := range chaos.FinalizersFunc() {
 		ns, name, err := cache.SplitMetaNamespaceKey(key)
 		if err != nil {
 			result = multierror.Append(result, err)
 			continue
 		}
 
-		var pod v1.Pod
-		err = r.Client.Get(ctx, types.NamespacedName{
+		_ = m.WithInit(types.NamespacedName{
 			Namespace: ns,
 			Name:      name,
-		}, &pod)
+		})
 
-		if err != nil {
-			if !k8serror.IsNotFound(err) {
-				result = multierror.Append(result, err)
-				continue
-			}
-
-			r.Log.Info("Pod not found", "namespace", ns, "name", name)
-			chaos.Finalizers = utils.RemoveFromFinalizer(chaos.Finalizers, key)
-			continue
-		}
-
-		err = r.recoverPod(ctx, &pod, chaos)
 		if err != nil {
 			result = multierror.Append(result, err)
 			continue
 		}
 
-		chaos.Finalizers = utils.RemoveFromFinalizer(chaos.Finalizers, key)
-	}
+		err = m.Commit(ctx)
+		// if pod not found or not running, directly return and giveup recover.
+		if err != nil && err != podnetworkmanager.ErrPodNotFound && err != podnetworkmanager.ErrPodNotRunning {
+			r.Log.Error(err, "fail to commit")
+		}
 
-	if chaos.Annotations[AnnotationCleanFinalizer] == AnnotationCleanFinalizerForced {
+		finalizer := chaos.FinalizersFunc()
+		finalizer = utils.RemoveFromFinalizer(chaos.FinalizersFunc(), key)
+	}
+	r.Log.Info("After recovering", "finalizers", chaos.FinalizersFunc())
+
+	if chaos.AnnotationsFunc()[common.AnnotationCleanFinalizer] == common.AnnotationCleanFinalizerForced {
 		r.Log.Info("Force cleanup all finalizers", "chaos", chaos)
-		chaos.Finalizers = chaos.Finalizers[:0]
+		finalizer := chaos.FinalizersFunc()
+		finalizer = chaos.FinalizersFunc()[:0]
 		return nil
 	}
 

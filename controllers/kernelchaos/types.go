@@ -124,8 +124,64 @@ func (r *Reconciler) Apply(ctx context.Context, req ctrl.Request, chaos v1alpha1
 
 // Recover means the reconciler recovers the chaos action
 func (r *Reconciler) Recover(ctx context.Context, req ctrl.Request, chaos v1alpha1.InnerObject) error {
-	var kernelChaos *v1alpha1.KernelChaos
-	return recover.Recover(ctx, req, chaos, kernelChaos)
+	kernelChaos, ok := chaos.(*v1alpha1.KernelChaos)
+	if !ok {
+		err := errors.New("chaos is not KernelChaos")
+		r.Log.Error(err, "chaos is not KernelChaos", "chaos", chaos)
+		return err
+	}
+
+	if err := r.cleanFinalizersAndRecover(ctx, kernelChaos); err != nil {
+		return err
+	}
+	r.Event(kernelChaos, v1.EventTypeNormal, utils.EventChaosRecovered, "")
+
+	return nil
+}
+
+func (r *Reconciler) cleanFinalizersAndRecover(ctx context.Context, chaos *v1alpha1.KernelChaos) error {
+	var result error
+
+	for _, key := range chaos.Finalizers {
+		ns, name, err := cache.SplitMetaNamespaceKey(key)
+		if err != nil {
+			result = multierror.Append(result, err)
+			continue
+		}
+
+		var pod v1.Pod
+		err = r.Client.Get(ctx, types.NamespacedName{
+			Namespace: ns,
+			Name:      name,
+		}, &pod)
+
+		if err != nil {
+			if !k8serror.IsNotFound(err) {
+				result = multierror.Append(result, err)
+				continue
+			}
+
+			r.Log.Info("Pod not found", "namespace", ns, "name", name)
+			chaos.Finalizers = utils.RemoveFromFinalizer(chaos.Finalizers, key)
+			continue
+		}
+
+		err = r.recoverPod(ctx, &pod, chaos)
+		if err != nil {
+			result = multierror.Append(result, err)
+			continue
+		}
+
+		chaos.Finalizers = utils.RemoveFromFinalizer(chaos.Finalizers, key)
+	}
+
+	if chaos.Annotations[common.AnnotationCleanFinalizer] == common.AnnotationCleanFinalizerForced {
+		r.Log.Info("Force cleanup all finalizers", "chaos", chaos)
+		chaos.Finalizers = chaos.Finalizers[:0]
+		return nil
+	}
+
+	return result
 }
 
 func (r *Reconciler) recoverPod(ctx context.Context, pod *v1.Pod, chaos *v1alpha1.KernelChaos) error {
