@@ -1,0 +1,6 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: HelloWorldChaos
+metadata:
+  name: hello-world
+  namespace: chaos-testing
+spec: {}
